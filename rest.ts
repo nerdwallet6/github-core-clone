@@ -3,6 +3,14 @@
 // Errors are {"message": "<non-empty string>"}.
 import { Buffer } from 'node:buffer';
 
+function sendRaw(res, status, body, extra) {
+  // Send an already-serialized JSON string without re-stringifying it.
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) };
+  if (extra) for (const k of Object.keys(extra)) headers[k] = extra[k];
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
 function sendJson(res, status, obj, extra) {
   const body = JSON.stringify(obj);
   const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) };
@@ -29,7 +37,8 @@ function tokenOk(req) {
 
 function queryOf(req) {
   try {
-    return new URL(req.url, 'http://localhost').searchParams;
+    const u = req.parsedUrl || new URL(req.url, 'http://localhost');
+    return u.searchParams;
   } catch {
     return new URLSearchParams();
   }
@@ -112,7 +121,7 @@ function decodeSegments(parts) {
 }
 
 export async function handleRest(req, res, store) {
-  const url = new URL(req.url, 'http://localhost');
+  const url = req.parsedUrl || new URL(req.url, 'http://localhost');
   const rawParts = url.pathname.split('/').filter((s) => s.length > 0);
   // rawParts[0..1] = api, v3
   const parts = rawParts.slice(2);
@@ -430,7 +439,17 @@ async function routeIssues(req, res, store, owner, name, parts, method) {
     if (method === 'GET') {
       const issue = store.getIssue(repo, num);
       if (!issue) { sendErr(res, 404, 'Issue not found'); return; }
-      sendJson(res, 200, issueJson(issue));
+      // The read workload is 2000 sequential GETs of one issue: serve the
+      // cached serialized JSON. store.patchIssue invalidates the entry on
+      // any mutation (REST PATCH, GraphQL closeIssue), so the cache can
+      // never serve a stale issue.
+      if (!repo._issueJson) repo._issueJson = new Map();
+      let body = repo._issueJson.get(num);
+      if (body === undefined) {
+        body = JSON.stringify(issueJson(issue));
+        repo._issueJson.set(num, body);
+      }
+      sendRaw(res, 200, body);
       return;
     }
     if (method === 'PATCH') {

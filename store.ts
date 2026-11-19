@@ -106,6 +106,13 @@ export function createStore() {
     return sha;
   }
 
+  function putObjectWithSha(sha, type, data) {
+    // Store an object whose sha is already known (e.g. computed while
+    // parsing a pack) instead of hashing it a second time.
+    if (!objects.has(sha)) objects.set(sha, { type, data });
+    return sha;
+  }
+
   function getObject(sha) {
     return objects.get(sha);
   }
@@ -153,14 +160,101 @@ export function createStore() {
     return build(pathMap, '');
   }
 
+  // lookupPath: walk tree objects along path segments; returns the file
+  // entry {blobSha, mode} or null (missing, or a directory, or a path
+  // through a file). Avoids flattening the whole tree for a single lookup.
+  function lookupPath(treeSha, path) {
+    if (!path || !treeSha || treeSha === ZERO_OID) return null;
+    const parts = path.split('/');
+    let cur = treeSha;
+    for (let i = 0; i < parts.length; i++) {
+      const obj = objects.get(cur);
+      if (!obj || obj.type !== 'tree') return null;
+      const found = parseTreeObject(obj.data).find((e) => e.name === parts[i]);
+      if (!found) return null;
+      if (i === parts.length - 1) {
+        if (found.mode === '40000') return null;
+        return { blobSha: found.oid, mode: found.mode };
+      }
+      if (found.mode !== '40000') return null;
+      cur = found.oid;
+    }
+    return null;
+  }
+
   function buildTree(baseTreeSha, changes) {
     // changes: Map path -> Buffer (new content) | null (delete)
-    const flat = readTreeRecursive(baseTreeSha, '', new Map());
-    for (const [path, content] of changes) {
-      if (content === null) flat.delete(path);
-      else flat.set(path, { blobSha: blobShaFor(content), mode: '100644' });
+    // Incremental update: only trees on a changed path are rebuilt, so a
+    // one-file change costs O(depth), not O(tree size). The produced tree
+    // bytes (and therefore shas) are identical to the old flatten+rebuild
+    // implementation: entries are kept as a list so a name that is both a
+    // file and a directory (a pathological collision the old code also
+    // emitted) behaves the same way.
+    if (!changes || changes.size === 0) {
+      if (baseTreeSha) return baseTreeSha;
+      return putObject('tree', Buffer.alloc(0));
     }
-    return treeFromPathMap(flat);
+    const r = applyTreeChanges(baseTreeSha, changes);
+    if (r.sha) return r.sha;
+    return putObject('tree', Buffer.alloc(0));
+  }
+
+  function applyTreeChanges(treeSha, relChanges) {
+    // Returns { sha, changed }: sha is the new tree sha, or null when the
+    // resulting tree has no entries. relChanges paths are relative to this
+    // tree level.
+    const entries = []; // [{mode, name, oid}] — list, not map (see buildTree)
+    if (treeSha && treeSha !== ZERO_OID) {
+      const obj = objects.get(treeSha);
+      if (obj && obj.type === 'tree') {
+        for (const e of parseTreeObject(obj.data)) entries.push({ mode: e.mode, name: e.name, oid: e.oid });
+      }
+    }
+    const direct = [];
+    const subdirs = new Map(); // dir name -> Map subPath -> content
+    for (const [path, content] of relChanges) {
+      const slash = path.indexOf('/');
+      if (slash < 0) direct.push([path, content]);
+      else {
+        const dir = path.slice(0, slash);
+        if (!subdirs.has(dir)) subdirs.set(dir, new Map());
+        subdirs.get(dir).set(path.slice(slash + 1), content);
+      }
+    }
+    let changed = false;
+    const fileIdx = (name) => entries.findIndex((e) => e.name === name && e.mode !== '40000');
+    const dirIdx = (name) => entries.findIndex((e) => e.name === name && e.mode === '40000');
+    for (const [name, content] of direct) {
+      if (content === null) {
+        // Delete a file entry only; deleting a directory path is a no-op,
+        // exactly like the old flatten implementation.
+        const i = fileIdx(name);
+        if (i >= 0) { entries.splice(i, 1); changed = true; }
+      } else {
+        const blobSha = blobShaFor(content);
+        const i = fileIdx(name);
+        if (i >= 0) {
+          if (entries[i].oid !== blobSha) { entries[i].oid = blobSha; changed = true; }
+        } else {
+          entries.push({ mode: '100644', name, oid: blobSha });
+          changed = true;
+        }
+      }
+    }
+    for (const [dir, sub] of subdirs) {
+      const i = dirIdx(dir);
+      const childSha = i >= 0 ? entries[i].oid : null;
+      const sub2 = applyTreeChanges(childSha, sub);
+      if (sub2.sha === null) {
+        if (i >= 0) { entries.splice(i, 1); changed = true; }
+      } else if (i < 0 || entries[i].oid !== sub2.sha) {
+        if (i >= 0) { entries[i].oid = sub2.sha; changed = true; }
+        else { entries.push({ mode: '40000', name: dir, oid: sub2.sha }); changed = true; }
+      }
+    }
+    if (!changed) return { sha: treeSha || null, changed: false };
+    if (entries.length === 0) return { sha: null, changed: true };
+    return { sha: putObject('tree', buildTreeObject(entries)), changed: true };
   }
 
   function makeCommit({ tree, parents, message }) {
@@ -195,9 +289,28 @@ export function createStore() {
     return c ? c.tree : null;
   }
 
+  // Ancestor results are immutable facts about an append-only commit
+  // graph, so memoize them: a push workload walks the same chains over
+  // and over, and each walk re-does the same parent traversal.
+  const ancestorCache = new Map();
+
   function isAncestor(anc, sha) {
     if (!anc || anc === ZERO_OID || !sha || sha === ZERO_OID) return false;
     if (anc === sha) return true;
+    const key = anc + '|' + sha;
+    const hit = ancestorCache.get(key);
+    if (hit !== undefined) return hit;
+    const result = isAncestorWalk(anc, sha);
+    ancestorCache.set(key, result);
+    return result;
+  }
+
+  function isAncestorWalk(anc, sha) {
+    // Fast path: a linear push's new tip always has the old tip as its
+    // direct parent — that is the common case, and it avoids walking the
+    // whole chain (which grows with every push).
+    const head = getCommit(sha);
+    if (head && head.parents.includes(anc)) return true;
     const seen = new Set();
     const stack = [sha];
     while (stack.length) {
@@ -267,8 +380,10 @@ export function createStore() {
     trialNowIso,
     hashObject,
     putObject,
+    putObjectWithSha,
     getObject,
     blobShaFor,
+    lookupPath,
     readTreeRecursive,
     treeFromPathMap,
     buildTree,
@@ -509,6 +624,8 @@ export function createStore() {
     if (typeof patch.body === 'string') issue.body = patch.body;
     if (Array.isArray(patch.labels)) issue.labels = patch.labels.slice();
     issue.updatedAt = trialNowIso();
+    // Invalidate the cached serialized issue JSON (see rest.ts).
+    if (repo._issueJson) repo._issueJson.delete(number);
     return issue;
   }
 
@@ -652,8 +769,8 @@ export function createStore() {
         parents.push(defTip);
       }
     }
-    const flat = readTreeRecursive(baseTree, '', new Map());
-    const existing = flat.get(path);
+    const flat = lookupPath(baseTree, path);
+    const existing = flat;
     const blobSha = blobShaFor(content);
     const changes = new Map([[path, content]]);
     const newTree = buildTree(baseTree, changes);
@@ -668,8 +785,7 @@ export function createStore() {
     const tip = getRef(repo, refname);
     if (!tip) return { error: 'no-branch' };
     const baseTree = commitTree(tip);
-    const flat = readTreeRecursive(baseTree, '', new Map());
-    const existing = flat.get(path);
+    const existing = lookupPath(baseTree, path);
     if (!existing) return { error: 'not-found' };
     const changes = new Map([[path, null]]);
     const newTree = buildTree(baseTree, changes);
@@ -682,12 +798,12 @@ export function createStore() {
     const tip = resolveRef(repo, ref);
     if (!tip) return { error: 'no-branch' };
     const tree = commitTree(tip);
-    const flat = readTreeRecursive(tree, '', new Map());
-    const entry = flat.get(path);
+    const entry = lookupPath(tree, path);
     if (entry) {
       const obj = objects.get(entry.blobSha);
       return { kind: 'file', blobSha: entry.blobSha, data: obj ? obj.data : Buffer.alloc(0) };
     }
+    const flat = readTreeRecursive(tree, '', new Map());
     // Directory?
     const prefix = path ? path + '/' : '';
     const children = new Map();

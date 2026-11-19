@@ -63,47 +63,54 @@ function encodePackObjectHeader(typeCode, size) {
   return Buffer.from(bytes);
 }
 
+const DEFLATED_CACHE = new Map(); // object sha -> deflated bytes (deterministic)
+
 function writePack(entries) {
   // entries: [{type, data: Buffer}] — plain objects, deterministic order.
-  const sorted = entries.slice().sort((a, b) => {
-    const sa = sha1Hex(Buffer.concat([Buffer.from(a.type + ' ' + a.data.length + '\0'), a.data]));
-    const sb = sha1Hex(Buffer.concat([Buffer.from(b.type + ' ' + b.data.length + '\0'), b.data]));
-    return sa < sb ? -1 : sa > sb ? 1 : 0;
+  // The sha of each entry is computed ONCE here: the old code recomputed
+  // it inside the sort comparator (O(n log n) hashes), which dominated
+  // pack generation for large packs. Deflated bytes are cached per object
+  // sha so a pack rebuilt for a new tip does not re-deflate unchanged
+  // objects.
+  const prepared = entries.map((e) => {
+    const header = Buffer.from(e.type + ' ' + e.data.length + '\0');
+    const sha = sha1Hex(Buffer.concat([header, e.data]));
+    return { type: e.type, data: e.data, sha };
   });
+  prepared.sort((a, b) => (a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
   const parts = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
   header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(sorted.length, 8);
+  header.writeUInt32BE(prepared.length, 8);
   parts.push(header);
-  for (const e of sorted) {
+  for (const e of prepared) {
     parts.push(encodePackObjectHeader(TYPE_CODES[e.type], e.data.length));
-    parts.push(deflateSync(e.data));
+    let deflated = DEFLATED_CACHE.get(e.sha);
+    if (!deflated) {
+      deflated = deflateSync(e.data);
+      DEFLATED_CACHE.set(e.sha, deflated);
+    }
+    parts.push(deflated);
   }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(sha1Hex(body), 'hex');
   return Buffer.concat([body, trailer]);
 }
 
-function findZlibEnd(buf, off, expectedSize) {
-  // inflateSync ignores trailing bytes and throws when truncated, so the
-  // minimal end offset that inflates to expectedSize is the stream end.
-  let lo = off + 1;
-  let hi = buf.length;
-  const ok = (end) => {
-    try {
-      return inflateSync(buf.subarray(off, end)).length === expectedSize;
-    } catch {
-      return false;
-    }
-  };
-  if (!ok(hi)) throw new Error('pack-zlib: stream does not terminate');
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (ok(mid)) hi = mid;
-    else lo = mid + 1;
-  }
-  return lo;
+function inflateAt(buf, off, expectedSize) {
+  // Inflate exactly one zlib stream starting at off, and report where it
+  // ends. The old code binary-searched the end with ~log2(n) trial
+  // inflates per object (~750us for a 1 KiB object). One inflateSync with
+  // {info:true} returns the engine, whose bytesWritten is exactly the
+  // number of compressed bytes consumed (~20us, synchronous — no stream
+  // scheduling and no event-loop hops per object).
+  const out = inflateSync(buf.subarray(off), { info: true });
+  const data = out.buffer;
+  if (data.length !== expectedSize) throw new Error('pack-size');
+  const end = off + out.engine.bytesWritten;
+  if (!end || end <= off || end > buf.length) throw new Error('pack-zlib: bad stream end');
+  return { data, end };
 }
 
 function readVarint(buf, off) {
@@ -200,9 +207,9 @@ function readPack(buf, resolveBase) {
     } else if (!CODE_TYPES[typeCode]) {
       throw new Error('pack-type ' + typeCode);
     }
-    const dataEnd = findZlibEnd(buf, pos, size);
-    const data = inflateSync(buf.subarray(pos, dataEnd));
-    if (data.length !== size) throw new Error('pack-size');
+    const inflated = inflateAt(buf, pos, size);
+    const data = inflated.data;
+    const dataEnd = inflated.end;
     rawEntries.push({ typeCode, data, baseOid, baseOff, offset: off });
     off = dataEnd;
   }
@@ -556,9 +563,9 @@ function parseFetchArgs(packets) {
 // ---------- receive-pack (v0 push) ----------
 const RESPONSE_CACHE = new Map(); // fetch responses, keyed by repo+args
 
-function cacheKeyFor(repo, wants, haves, shallow, deepen, v2) {
+function cacheKeyFor(repo, wants, haves, shallow, deepen, v2, filter) {
   return repo.owner + '/' + repo.name + '|' + (v2 ? 'v2' : 'v0') + '|' +
-    JSON.stringify([wants.slice().sort(), (haves || []).slice().sort(), (shallow || []).slice().sort(), deepen]);
+    JSON.stringify([wants.slice().sort(), (haves || []).slice().sort(), (shallow || []).slice().sort(), deepen, filter || null]);
 }
 
 function invalidateRepoCache(repo) {
@@ -608,7 +615,7 @@ function handlePush(store, repo, body) {
     try {
       const pack = readPack(packBytes, (oid) => store.getObject(oid) || null);
       for (const [sha, obj] of pack.objects) {
-        if (!store.getObject(sha)) store.putObject(obj.type, obj.data);
+        if (!store.getObject(sha)) store.putObjectWithSha(sha, obj.type, obj.data);
       }
     } catch (e) {
       unpackOk = false;
@@ -691,7 +698,7 @@ function sendJsonGit(res, status, obj) {
 }
 
 export async function handleGit(req, res, store) {
-  const url = new URL(req.url, 'http://localhost');
+  const url = req.parsedUrl || new URL(req.url, 'http://localhost');
   const m = url.pathname.match(/^\/([^/]+)\/([^/]+)\.git(\/.*)?$/);
   if (!m) { sendJsonGit(res, 404, { message: 'Not Found' }); return; }
   const owner = decodeURIComponent(m[1]);
@@ -741,7 +748,7 @@ export async function handleGit(req, res, store) {
     }
     if (wantV2 && first === 'command=fetch') {
       const args = parseFetchArgs(packets);
-      const key = cacheKeyFor(repo, args.wants, args.haves, args.shallow, args.deepen, true);
+      const key = cacheKeyFor(repo, args.wants, args.haves, args.shallow, args.deepen, true, args.filter);
       let out = RESPONSE_CACHE.get(key);
       if (!out) {
         out = fetchResponseV2(store, args.wants, args.haves, args.shallow, args.deepen);
@@ -758,7 +765,7 @@ export async function handleGit(req, res, store) {
       res.end(Buffer.concat([pktLine('NAK\n'), FLUSH]));
       return;
     }
-    const key = cacheKeyFor(repo, args.wants, args.haves, args.shallow, args.deepen, false);
+    const key = cacheKeyFor(repo, args.wants, args.haves, args.shallow, args.deepen, false, args.filter);
     let out = RESPONSE_CACHE.get(key);
     if (!out) {
       out = fetchResponseV0(store, args.wants, args.haves, args.shallow, args.deepen);

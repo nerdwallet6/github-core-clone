@@ -32,7 +32,12 @@ export function createApp() {
       req.jsonBody = undefined;
       req.jsonError = false;
       const ct = req.headers['content-type'] || '';
-      if (req.rawBody.length > 0 && (ct.includes('json') || req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE')) {
+      // Parse a JSON body only when the content type says JSON, or when
+      // there is no content type at all (some clients omit it). Git smart
+      // HTTP bodies are binary with an x-git-* content type: attempting
+      // JSON.parse on every push pack wasted time and flagged jsonError.
+      const mayBeJson = ct.includes('json') || (!ct && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE'));
+      if (req.rawBody.length > 0 && mayBeJson) {
         try {
           req.jsonBody = JSON.parse(req.rawBody.toString('utf8'));
         } catch {
@@ -52,7 +57,8 @@ export function createApp() {
 async function dispatch(req, res, store) {
   let path = '/';
   try {
-    path = new URL(req.url, 'http://localhost').pathname;
+    req.parsedUrl = new URL(req.url, 'http://localhost');
+    path = req.parsedUrl.pathname;
   } catch {
     path = req.url || '/';
   }
